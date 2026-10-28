@@ -1,0 +1,66 @@
+// What a terrain's ground is drawn from (see TerrainProcessor): its regions' maps as texture arrays, one layer a region,
+// a map of which layer each region is in, and its ground textures; all shared by its rings' vertex stage
+// (TerrainRingDisplacement) and its colour (TerrainGroundColor).
+namespace Stride.Terrain
+{
+    shader TerrainMaps : Texturing
+    {
+        // Each region's heights (a float a sample), control words (as floats' bits: see TerrainControl) and colours.
+        stage Texture2DArray HeightMaps;
+        stage Texture2DArray ControlMaps;
+        stage Texture2DArray ColorMaps;
+
+        // Which layer each region is in, plus one (0 for none): RegionMapSize regions across, the terrain's origin in its middle.
+        stage Texture2D RegionMap;
+
+        // Its ground textures: albedo, with height in alpha (for blending one into another).
+        stage Texture2DArray AlbedoMaps;
+
+        cbuffer PerMaterial
+        {
+            // Where the terrain's sample (0, 0) is, in the world, and how far apart its samples are.
+            stage float3 TerrainOrigin;
+            stage float VertexSpacing = 2.0f;
+            stage float RegionSize = 512.0f;
+            stage float RegionMapSize = 32.0f;
+
+            // How many of its own cells each ring reaches out from its middle; where the camera is, for the rings' morphing.
+            stage float RingCells = 80.0f;
+            stage float3 TerrainCamera;
+
+            // How sharp the blend between textures is, 0 to 1.
+            stage float BlendSharpness = 0.5f;
+
+            // Each ground texture's tiling (four to an element) and tint.
+            stage float4 TextureUvScales[8];
+            stage float4 TextureTints[32];
+        }
+
+        // Where a sample is (in samples from the origin): its place in its region, and its region's layer (-1 for none).
+        int3 IndexCoord(float2 sample)
+        {
+            float2 at = round(sample);
+            float2 region = floor(at / RegionSize);
+            float2 map = region + RegionMapSize * 0.5f;
+            if (map.x < 0 || map.y < 0 || map.x >= RegionMapSize || map.y >= RegionMapSize)
+                return int3(0, 0, -1);
+            int layer = (int)RegionMap.Load(int3((int2)map, 0)).r - 1;
+            return int3((int2)(at - region * RegionSize), layer);
+        }
+
+        float HeightOf(int3 index)
+        {
+            return index.z < 0 ? 0.0f : HeightMaps.Load(int4(index, 0)).r;
+        }
+
+        uint ControlOf(int3 index)
+        {
+            return index.z < 0 ? 0u : asuint(ControlMaps.Load(int4(index, 0)).r);
+        }
+
+        float UvScale(int id)
+        {
+            return TextureUvScales[id / 4][id % 4];
+        }
+    };
+}

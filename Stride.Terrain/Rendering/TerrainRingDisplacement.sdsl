@@ -1,0 +1,47 @@
+// A terrain ring's vertex: lifted from its flat grid to the ground's height there (see TerrainMaps), as the island's
+// Godot shader lifted it. Towards its ring's outer edge, a vertex on an odd line morphs onto the even one before it, so
+// by the edge the ring is the next one's grid, and they meet with no seams and nothing popping. No ground (its vertex
+// made NaN, so its triangles are not drawn) in holes, or outside the regions.
+namespace Stride.Terrain
+{
+    shader TerrainRingDisplacement : IMaterialSurface, TerrainMaps, PositionStream4, NormalStream, Transformation
+    {
+        override void Compute()
+        {
+            float4 world = mul(streams.Position, World);
+            // The ring's cells are its scale; its vertices on whole cells.
+            float scale = World[0][0];
+            float2 local = (world.xz - TerrainOrigin.xz);
+            float2 cell = round(local / scale);
+
+            // Morphing in from 76% of the way out to 96%: past where the inner ring reaches, before its outer edge.
+            float away = length(world.xz - TerrainCamera.xz) / scale;
+            float morph = smoothstep(RingCells * 0.7625f, RingCells * 0.9625f, away);
+            float2 odd = cell - 2.0f * floor(cell * 0.5f);
+            float2 start = local / VertexSpacing;
+            float2 end = (cell - odd) * scale / VertexSpacing;
+            world.xz -= odd * scale * morph;
+
+            int3 at = IndexCoord(start);
+            uint control = ControlOf(at);
+            float3 normal = float3(0, 1, 0);
+            if (at.z < 0 || (control & 4u) != 0)
+            {
+                world.x = asfloat(0x7fc00000u);
+            }
+            else
+            {
+                int3 to = IndexCoord(end);
+                float h = lerp(HeightOf(at), HeightOf(to), morph);
+                float u = lerp(HeightOf(IndexCoord(start + float2(1, 0))), HeightOf(IndexCoord(end + float2(1, 0))), morph);
+                float v = lerp(HeightOf(IndexCoord(start + float2(0, 1))), HeightOf(IndexCoord(end + float2(0, 1))), morph);
+                world.y = TerrainOrigin.y + h;
+                normal = normalize(float3(h - u, VertexSpacing, h - v));
+            }
+
+            streams.Position = mul(world, WorldInverse);
+            // Back into the ring's own space, which the world turns it from (scaled along x and z): by the world's transpose.
+            streams.meshNormal = normalize(mul(normal, transpose((float3x3)World)));
+        }
+    };
+}
