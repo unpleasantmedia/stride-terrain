@@ -52,6 +52,8 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
         public int? State;
         // A new state seen, and since when (in the editor, where its settings arrive one change at a time).
         public int? Pending;
+        // When it was last fitted (by roads), for writing it once that has stopped.
+        public double FittedAt;
         public double PendingSince;
         public Material? Material;
         public Mesh[] Meshes = Array.Empty<Mesh>();
@@ -68,6 +70,9 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
     private IGraphicsDeviceService? graphics;
 
     protected override void OnSystemAdd() => graphics = Services.GetService<IGraphicsDeviceService>();
+
+    /// <summary>Its terrains, as of now.</summary>
+    internal IReadOnlyCollection<TerrainComponent> Terrains => ComponentDatas.Keys;
 
     protected override Built GenerateComponentData(Entity entity, TerrainComponent component) => new();
 
@@ -91,6 +96,18 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
         var camera = Camera();
         foreach (var (terrain, data) in ComponentDatas)
         {
+            // Fitted (by roads, through the plugin API): written to its files once the fitting has stood a second.
+            if (terrain.SaveWanted)
+            {
+                if (terrain.Changed.Count > 0)
+                    data.FittedAt = time.Total.TotalSeconds;
+                else if (time.Total.TotalSeconds - data.FittedAt >= 1.0)
+                {
+                    terrain.SaveWanted = false;
+                    terrain.Save();
+                }
+            }
+
             var state = State(terrain);
             // In the editor, built anew only once its state has stood a moment: an edit of many steps (as an import
             // filling its list of regions) builds it once, not at each step. At once the first time, and in the game.

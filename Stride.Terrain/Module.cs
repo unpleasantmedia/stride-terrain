@@ -14,5 +14,6 @@ internal static class Module
     public static void Initialize()
     {
         AssemblyRegistry.Register(typeof(Module).GetTypeInfo().Assembly, AssemblyCommonCategories.Assets);
+        TerrainApi.Register();
     }
 }

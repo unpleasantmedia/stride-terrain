@@ -133,6 +133,10 @@ public sealed class TerrainComponent : EntityComponent, ITerrainGround
         Version++;
     }
 
+    /// <summary>Its ground fitted to things on it (as roads, through the plugin API), to be put back as they move.</summary>
+    [DataMemberIgnore]
+    public TerrainFits Fits { get; } = new();
+
     /// <summary>Regions changed since they were last put on the GPU and collided with, for its processor to take up.</summary>
     [DataMemberIgnore]
     internal HashSet<(int X, int Z)> Changed { get; } = new();
@@ -144,6 +148,22 @@ public sealed class TerrainComponent : EntityComponent, ITerrainGround
             Changed.Add((region.X, region.Z));
         Version++;
     }
+
+    /// <summary>
+    /// Tells it these regions were fitted to something on it (see <see cref="Fits"/>): drawn again, and written to their
+    /// files once fitting has stopped a second (in the editor), but not counted in <see cref="Version"/>, as what fits
+    /// it follows its ground as it was before fits.
+    /// </summary>
+    public void MarkFitted(IEnumerable<TerrainRegion> regions)
+    {
+        foreach (var region in regions)
+            Changed.Add((region.X, region.Z));
+        SaveWanted = true;
+    }
+
+    /// <summary>Whether its regions want writing to their files, once fitting has stopped (see <see cref="MarkFitted"/>).</summary>
+    [DataMemberIgnore]
+    internal bool SaveWanted { get; set; }
 
     /// <summary>
     /// How many times its ground has changed (sculpted, painted, imported) since it was made: for what reads it (as a

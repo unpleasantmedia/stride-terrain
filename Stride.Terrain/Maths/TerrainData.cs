@@ -89,7 +89,13 @@ public sealed class TerrainData
     }
 
     /// <summary>How high the ground is at a place (between its samples, blended from the four round it), or NaN where there is none.</summary>
-    public float HeightAt(Vector3 at)
+    public float HeightAt(Vector3 at) => HeightAt(at, HeightOf);
+
+    /// <summary>
+    /// How high the ground is at a place, as <see cref="HeightAt(Vector3)"/>, with each sample's height from
+    /// <paramref name="sample"/> (as one giving them as they were before fits).
+    /// </summary>
+    public float HeightAt(Vector3 at, Func<int, int, float> sample)
     {
         if (TerrainControl.IsHole(ControlAt(at)))
             return float.NaN;
@@ -98,8 +104,8 @@ public sealed class TerrainData
         var x0 = (int)MathF.Floor(x);
         var z0 = (int)MathF.Floor(z);
         var (fx, fz) = (x - x0, z - z0);
-        var (a, b) = (HeightOf(x0, z0), HeightOf(x0 + 1, z0));
-        var (c, d) = (HeightOf(x0, z0 + 1), HeightOf(x0 + 1, z0 + 1));
+        var (a, b) = (sample(x0, z0), sample(x0 + 1, z0));
+        var (c, d) = (sample(x0, z0 + 1), sample(x0 + 1, z0 + 1));
         return Lerp(Lerp(a, b, fx), Lerp(c, d, fx), fz);
     }
 
