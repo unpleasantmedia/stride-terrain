@@ -120,6 +120,9 @@ public sealed class TerrainStroke
             case TerrainBrushKind.SetHeight:
                 return Heights(block, (x, z, h) => Lerp(h, brush.Height, Towards(Falloff(x, z))));
             case TerrainBrushKind.Paint:
+                // Inverted (ctrl): back to the height and slope rules where the brush is at least half strength.
+                if (Inverted)
+                    return Control(block, (x, z, c) => Falloff(x, z) >= 0.5f ? TerrainControl.WithTextures(TerrainControl.With(c, TerrainControl.AutoBit, true), 0, 0, 0f) : c);
                 return Control(block, (x, z, c) => Painted(c, brush.Texture, Falloff(x, z) * Math.Clamp(brush.Strength * seconds * 4f, 0f, 1f), Falloff(x, z)));
             case TerrainBrushKind.Holes:
                 return Control(block, (x, z, c) => Falloff(x, z) > 0.3f ? TerrainControl.With(c, TerrainControl.HoleBit, !Inverted) : c);
@@ -222,4 +225,128 @@ public sealed class TerrainStroke
     public Dictionary<(int X, int Z), uint> ControlAfter() => ControlBefore.Keys.ToDictionary(p => p, p => data.ControlOf(p.X, p.Z));
 
     private static float Lerp(float a, float b, float t) => a + (b - a) * t;
+}
+
+/// <summary>
+/// A brush applied to all of a terrain's ground at once, at full strength everywhere (its size and falloff aside), for
+/// one second's work: straight on each region's samples, not sample by sample as a stroke keeps them.
+/// </summary>
+public static class TerrainWholeBrush
+{
+    /// <summary>
+    /// Applies it to every region the terrain has (making none): <paramref name="flattenTo"/> is the height Flatten
+    /// brings it to. Gives the regions it changed.
+    /// </summary>
+    public static List<TerrainRegion> Apply(TerrainData data, TerrainBrushKind kind, bool inverted, float flattenTo, TerrainBrushSettings brush)
+    {
+        const float seconds = 1f;
+        var regions = data.All.ToList();
+        var towards = Math.Clamp(brush.Strength * seconds, 0f, 1f);
+        var changed = new List<TerrainRegion>();
+        switch (kind)
+        {
+            case TerrainBrushKind.Raise or TerrainBrushKind.Lower:
+                var by = ((kind == TerrainBrushKind.Raise) != inverted ? 1f : -1f) * brush.Strength * seconds;
+                foreach (var region in regions)
+                    Heights(region, changed, h => h + by);
+                break;
+            case TerrainBrushKind.Flatten:
+                foreach (var region in regions)
+                    Heights(region, changed, h => h + (flattenTo - h) * towards);
+                break;
+            case TerrainBrushKind.SetHeight:
+                foreach (var region in regions)
+                    Heights(region, changed, h => h + (brush.Height - h) * towards);
+                break;
+            case TerrainBrushKind.Smooth:
+                Smooth(data, regions, towards, changed);
+                break;
+            case TerrainBrushKind.Paint:
+                var amount = Math.Clamp(brush.Strength * seconds * 4f, 0f, 1f);
+                foreach (var region in regions)
+                {
+                    Control(region, changed, c => inverted
+                        ? TerrainControl.WithTextures(TerrainControl.With(c, TerrainControl.AutoBit, true), 0, 0, 0f)
+                        : TerrainStroke.Painted(c, brush.Texture, amount, 1f));
+                }
+                break;
+            case TerrainBrushKind.Holes:
+                foreach (var region in regions)
+                    Control(region, changed, c => TerrainControl.With(c, TerrainControl.HoleBit, !inverted));
+                break;
+        }
+        foreach (var region in changed)
+            region.Modified = true;
+        return changed;
+    }
+
+    private static void Heights(TerrainRegion region, List<TerrainRegion> changed, Func<float, float> change)
+    {
+        var any = false;
+        var heights = region.Heights;
+        for (var i = 0; i < heights.Length; i++)
+        {
+            var now = change(heights[i]);
+            if (now != heights[i])
+                (heights[i], any) = (now, true);
+        }
+        if (any)
+            changed.Add(region);
+    }
+
+    private static void Control(TerrainRegion region, List<TerrainRegion> changed, Func<uint, uint> change)
+    {
+        var any = false;
+        var control = region.Control;
+        for (var i = 0; i < control.Length; i++)
+        {
+            var now = change(control[i]);
+            if (now != control[i])
+                (control[i], any) = (now, true);
+        }
+        if (any)
+            changed.Add(region);
+    }
+
+    /// <summary>Each sample towards the mean of it and its eight neighbours as they all were before (across regions' edges).</summary>
+    private static void Smooth(TerrainData data, List<TerrainRegion> regions, float towards, List<TerrainRegion> changed)
+    {
+        var size = data.RegionSize;
+        var before = regions.ToDictionary(r => (r.X, r.Z), r => (float[])r.Heights.Clone());
+        float Before(int x, int z)
+        {
+            var (rx, rz) = data.RegionOf(x, z);
+            return before.TryGetValue((rx, rz), out var heights) ? heights[(z - rz * size) * size + (x - rx * size)] : float.NaN;
+        }
+        foreach (var region in regions)
+        {
+            var any = false;
+            var own = before[(region.X, region.Z)];
+            for (var lz = 0; lz < size; lz++)
+            {
+                for (var lx = 0; lx < size; lx++)
+                {
+                    var (sum, count) = (0f, 0);
+                    var inside = lx > 0 && lz > 0 && lx < size - 1 && lz < size - 1;
+                    for (var dz = -1; dz <= 1; dz++)
+                    {
+                        for (var dx = -1; dx <= 1; dx++)
+                        {
+                            var n = inside ? own[(lz + dz) * size + lx + dx] : Before(region.X * size + lx + dx, region.Z * size + lz + dz);
+                            if (float.IsNaN(n))
+                                continue;
+                            sum += n;
+                            count++;
+                        }
+                    }
+                    var i = lz * size + lx;
+                    var now = own[i] + (sum / count - own[i]) * towards;
+                    if (now != region.Heights[i])
+                        (region.Heights[i], any) = (now, true);
+                }
+            }
+            if (any)
+                changed.Add(region);
+        }
+    }
 }

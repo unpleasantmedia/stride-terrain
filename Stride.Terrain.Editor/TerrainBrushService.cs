@@ -18,6 +18,7 @@ using Stride.Core.Diagnostics;
 using Stride.Core.IO;
 using Stride.Core.Mathematics;
 using Stride.Core.Presentation.Dirtiables;
+using Stride.Core.Quantum;
 using Stride.Editor.EditorGame.Game;
 using Stride.Engine;
 using Stride.Engine.Processors;
@@ -35,7 +36,9 @@ namespace Stride.Terrain.Editor;
 /// Height, Paint and Holes, one on at a time (Escape turns it off). Hold the mouse on the ground to work it: the brush
 /// keeps working while held, strongest at its middle and fading to nothing at its edge (its size, falloff, strength,
 /// texture and height are the terrain's Brush settings). Ctrl turns Raise into Lower (and back), and holes into filling
-/// them; ctrl-click with Set Height takes the ground's height there. Sculpting where the terrain has no region yet makes
+/// them, and Paint into handing the ground back to its material's height and slope rules; ctrl-click with Set Height
+/// takes the ground's height there, and ctrl+shift-click puts the brush on all of the terrain at once, at full strength,
+/// for a second's work (Flatten to the height clicked). Sculpting where the terrain has no region yet makes
 /// one. Each stroke is one step to undo, and is written to the terrain's region files as it ends. A circle on the ground
 /// shows the brush, and inside it, where its falloff starts.
 /// </summary>
@@ -62,6 +65,9 @@ public sealed class TerrainBrushService : EditorGameMouseServiceBase, IEditorGam
 
     /// <summary>A brush turned on (its index) or off (-2) by its toolbar button, on the UI thread, for the next frame; -1 for neither.</summary>
     private int requested = -1;
+
+    /// <summary>The terrain being imported into, until its Import is unticked on the game's side.</summary>
+    private TerrainComponent? importing;
 
     private TerrainStroke? stroke;
     private TerrainComponent? stroking;
@@ -125,6 +131,10 @@ public sealed class TerrainBrushService : EditorGameMouseServiceBase, IEditorGam
     private void Step(float seconds)
     {
         var terrain = SelectedTerrain();
+        if (importing is { Import: false })
+            importing = null;
+        if (terrain is { Import: true } && importing == null)
+            Import(terrain);
         var nowAvailable = IsActive && terrain != null;
         if (nowAvailable != available)
         {
@@ -158,14 +168,23 @@ public sealed class TerrainBrushService : EditorGameMouseServiceBase, IEditorGam
         var at = Ground(terrain, input.MousePosition);
         ShowCursor(at, terrain.BrushRadius, terrain.BrushRadius * (1f - terrain.BrushFalloff));
         var ctrl = input.IsKeyDown(Keys.LeftCtrl) || input.IsKeyDown(Keys.RightCtrl);
+        var shift = input.IsKeyDown(Keys.LeftShift) || input.IsKeyDown(Keys.RightShift);
+
+        // Ctrl+shift-click: the brush on all of the terrain at once (Flatten to the height clicked).
+        if (stroke == null && ctrl && shift && input.IsMouseButtonPressed(MouseButton.Left) && IsMouseAvailable
+            && !input.IsMouseButtonDown(MouseButton.Right) && terrain.Data != null)
+        {
+            ApplyWhole(terrain, kind, at is { } clicked ? clicked.Y - terrain.Origin.Y : 0f);
+            return;
+        }
 
         if (stroke == null && input.IsMouseButtonPressed(MouseButton.Left) && IsMouseAvailable && !input.IsMouseButtonDown(MouseButton.Right)
             && at is { } start && terrain.Data != null)
         {
-            // Ctrl-click with Set Height takes the ground's height there.
+            // Ctrl-click with Set Height takes the ground's height there, in the world.
             if (kind == TerrainBrushKind.SetHeight && ctrl)
             {
-                var height = MathF.Round((start.Y - terrain.Origin.Y) * 10f) / 10f;
+                var height = MathF.Round(start.Y * 10f) / 10f;
                 editor.Dispatcher.InvokeAsync(() => SetSetting(terrain, nameof(TerrainComponent.SetHeight), height));
                 return;
             }
@@ -213,9 +232,10 @@ public sealed class TerrainBrushService : EditorGameMouseServiceBase, IEditorGam
         var heightsAfter = done.HeightsAfter();
         var controlBefore = done.ControlBefore.ToDictionary(p => p.Key, p => p.Value);
         var controlAfter = done.ControlAfter();
-        var added = done.Added.ToList();
+        // All its regions, not only those made now: some are read from their files without being in its list.
+        var added = terrain.Data?.Locations.ToList() ?? done.Added.ToList();
         var entityId = terrain.Entity.Id;
-        if (heightsBefore.Count == 0 && controlBefore.Count == 0 && added.Count == 0)
+        if (heightsBefore.Count == 0 && controlBefore.Count == 0 && done.Added.Count == 0)
             return;
         editor.Dispatcher.InvokeAsync(() =>
         {
@@ -248,6 +268,73 @@ public sealed class TerrainBrushService : EditorGameMouseServiceBase, IEditorGam
         });
     }
 
+    /// <summary>
+    /// The brush on all of the terrain, as one step to undo: what its regions were before and are after kept whole
+    /// (their heights or control words, as the brush changes), as a stroke's samples are too many.
+    /// </summary>
+    private void ApplyWhole(TerrainComponent terrain, TerrainBrushKind kind, float flattenTo)
+    {
+        var data = terrain.Data!;
+        var heights = kind is not (TerrainBrushKind.Paint or TerrainBrushKind.Holes);
+        var before = data.All.ToDictionary(r => (r.X, r.Z), r => (Array)(heights ? r.Heights.Clone() : r.Control.Clone()));
+        var changed = TerrainWholeBrush.Apply(data, kind, false, flattenTo, terrain.Brush);
+        if (changed.Count == 0)
+            return;
+        terrain.MarkChanged(changed);
+        terrain.Save();
+        var was = changed.ToDictionary(r => (r.X, r.Z), r => before[(r.X, r.Z)]);
+        var now = changed.ToDictionary(r => (r.X, r.Z), r => (Array)(heights ? r.Heights.Clone() : r.Control.Clone()));
+        var entityId = terrain.Entity.Id;
+        editor.Dispatcher.InvokeAsync(() =>
+        {
+            using var transaction = editor.UndoRedoService.CreateTransaction();
+            editor.UndoRedoService.PushOperation(new WholeOperation(this, entityId, was, now));
+            editor.UndoRedoService.SetName(transaction, $"Terrain: {Name(kind)} all");
+        });
+    }
+
+    /// <summary>Puts whole regions' heights or control words back (or on again), on the game's side, and writes them to their files.</summary>
+    private void Apply(Guid entityId, IReadOnlyDictionary<(int X, int Z), Array> regions)
+    {
+        controller.InvokeAsync(() =>
+        {
+            if (FindTerrain(entityId) is not { Data: { } data } terrain)
+                return;
+            var changed = new List<TerrainRegion>();
+            foreach (var ((x, z), values) in regions)
+            {
+                if (data.Region(x, z) is not { } region)
+                    continue;
+                if (values is float[] h)
+                    Array.Copy(h, region.Heights, h.Length);
+                else if (values is uint[] c)
+                    Array.Copy(c, region.Control, c.Length);
+                region.Modified = true;
+                changed.Add(region);
+            }
+            terrain.MarkChanged(changed);
+            terrain.Save();
+        });
+    }
+
+    /// <summary>The brush on all of a terrain, to undo and redo.</summary>
+    private sealed class WholeOperation : DirtyingOperation
+    {
+        private readonly TerrainBrushService service;
+        private readonly Guid entityId;
+        private readonly IReadOnlyDictionary<(int X, int Z), Array> before, after;
+
+        public WholeOperation(TerrainBrushService service, Guid entityId, IReadOnlyDictionary<(int X, int Z), Array> before, IReadOnlyDictionary<(int X, int Z), Array> after)
+            : base(service.editor.Asset.Dirtiables)
+        {
+            (this.service, this.entityId, this.before, this.after) = (service, entityId, before, after);
+        }
+
+        protected override void Undo() => service.Apply(entityId, before);
+
+        protected override void Redo() => service.Apply(entityId, after);
+    }
+
     /// <summary>A stroke, to undo and redo.</summary>
     private sealed class StrokeOperation : DirtyingOperation
     {
@@ -268,6 +355,74 @@ public sealed class TerrainBrushService : EditorGameMouseServiceBase, IEditorGam
         protected override void Undo() => service.Apply(entityId, heightsBefore, controlBefore);
 
         protected override void Redo() => service.Apply(entityId, heightsAfter, controlAfter);
+    }
+
+    /// <summary>
+    /// Imports its height map (game side) in place of all its ground: its old region files deleted and the new ones
+    /// written, then (asset side) its list of regions made the new ones and its Import unticked. Its files are not put
+    /// back by undoing it.
+    /// </summary>
+    private void Import(TerrainComponent terrain)
+    {
+        importing = terrain;
+        var entityId = terrain.Entity.Id;
+        var (folder, size, spacing, low, high) = (terrain.Folder, terrain.RegionSize, terrain.VertexSpacing, terrain.ImportLowest, terrain.ImportHighest);
+        var old = TerrainStorage.Found(folder).Concat(terrain.Regions.Select(r => (r.X, r.Y))).Distinct().ToList();
+        var file = terrain.HeightMap?.Trim().Trim('"');
+        var sceneFolder = Path.GetDirectoryName(editor.Asset.AssetItem.FullPath.ToOSPath()) ?? "";
+
+        // Read, made into regions and written off the game's thread, so the editor carries on meanwhile.
+        Task.Run(() =>
+        {
+            if (string.IsNullOrEmpty(file))
+                throw new InvalidOperationException("Give it a height map first.");
+            var map = TerrainHeightMap.Read(Path.IsPathRooted(file) ? file : Path.Combine(sceneFolder, file));
+            var regions = map.ToRegions(size, low, high);
+            foreach (var (x, z) in old)
+                TerrainStorage.Delete(folder, x, z);
+            Parallel.ForEach(regions, region => TerrainStorage.Save(folder, region));
+            Logger.Info($"Imported a {map.Width}x{map.Height} height map as {regions.Count} regions.");
+            return regions;
+        }).ContinueWith(done =>
+        {
+            List<Int2>? made = null;
+            if (done.IsFaulted)
+            {
+                var error = done.Exception!.GetBaseException();
+                Logger.Error($"The height map could not be imported: {error.Message}", error);
+            }
+            else
+            {
+                var regions = done.Result;
+                var byPlace = regions.ToDictionary(r => (r.X, r.Z));
+                controller.InvokeAsync(() =>
+                {
+                    terrain.ReplaceData(new TerrainData(size, spacing, byPlace.Keys, (x, z) => byPlace.GetValueOrDefault((x, z))));
+                    terrain.MarkChanged(regions);
+                });
+                made = regions.Select(r => new Int2(r.X, r.Z)).ToList();
+            }
+
+            // Its list made the new regions and its Import unticked, as one step; it is not imported again until the
+            // game's side has it unticked (see Step).
+            editor.Dispatcher.InvokeAsync(() =>
+            {
+                if (!editor.Asset.Asset.Hierarchy.Parts.TryGetValue(entityId, out var design) || design.Entity.Get<TerrainComponent>() is not { } asset)
+                    return;
+                using var transaction = editor.UndoRedoService.CreateTransaction();
+                var node = editor.Session.AssetNodeContainer.GetOrCreateNode(asset);
+                if (made != null)
+                {
+                    var list = node[nameof(TerrainComponent.Regions)].Target!;
+                    for (var i = asset.Regions.Count - 1; i >= 0; i--)
+                        list.Remove(asset.Regions[i], new NodeIndex(i));
+                    foreach (var region in made)
+                        list.Add(region);
+                }
+                node[nameof(TerrainComponent.Import)].Update(false);
+                editor.UndoRedoService.SetName(transaction, "Terrain: Import height map");
+            });
+        });
     }
 
     /// <summary>Sets one of a terrain's settings (asset side), as one step to undo.</summary>

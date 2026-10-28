@@ -11,6 +11,7 @@ using Stride.Physics;
 using Stride.Rendering;
 using Stride.Rendering.Materials;
 using Stride.Rendering.Materials.ComputeColors;
+using Stride.Shaders;
 using Buffer = Stride.Graphics.Buffer;
 
 namespace Stride.Terrain;
@@ -19,7 +20,7 @@ namespace Stride.Terrain;
 /// Draws each <see cref="TerrainComponent"/>'s ground as a clipmap, as the Godot terrain did: a square of
 /// <see cref="RingCells"/> cells each way round the camera, then <see cref="TerrainComponent.Levels"/> - 1 square rings
 /// round it, each with cells twice the size of the one inside it. The rings are flat grids; the ground's material
-/// (<see cref="TerrainRingFeature"/>, <c>TerrainGroundColor.sdsl</c>) lifts them to the heights it reads from the regions'
+/// (<c>TerrainRingDisplacement.sdsl</c>, added to its material) lifts them to the heights it reads from the regions'
 /// maps, which this puts on the GPU as texture arrays, along with the ground textures. The rings follow the camera in steps
 /// of their cells' size. Regions changed (<see cref="TerrainComponent.MarkChanged"/>) are put on the GPU again, and in
 /// the game, collided with again. What it makes is on an entity of its own at the scene's root, never saved.
@@ -42,17 +43,26 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
     /// <summary>Where the camera is, in the editor (set by its plugin); none in the game, where it is the graphics compositor's first camera.</summary>
     public static Func<Vector3?>? EditorCamera { get; set; }
 
+    /// <summary>How long, in seconds, its state stands before it is built anew in the editor.</summary>
+    private const double SettleSeconds = 0.25;
+
     public sealed class Built
     {
         public Entity? Holder;
         public int? State;
+        // A new state seen, and since when (in the editor, where its settings arrive one change at a time).
+        public int? Pending;
+        public double PendingSince;
         public Material? Material;
         public Mesh[] Meshes = Array.Empty<Mesh>();
         public List<(Entity Ring, Model Model)> Rings = new();
-        public Texture? Heights, Control, Colors, RegionMap, Albedo;
+        public Texture? Heights, Control, Colors, RegionMap;
         public Dictionary<(int X, int Z), int> Layers = new();
         public Dictionary<(int X, int Z), Entity> Tiles = new();
         public Vector3? Followed;
+        // Its lowest and highest ground (from its origin), for its rings' bounds; and the bounds last set (in the world).
+        public float Low = float.MaxValue, High = float.MinValue;
+        public (float Low, float High)? Bounded;
     }
 
     private IGraphicsDeviceService? graphics;
@@ -82,7 +92,16 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
         foreach (var (terrain, data) in ComponentDatas)
         {
             var state = State(terrain);
-            if (state != data.State)
+            // In the editor, built anew only once its state has stood a moment: an edit of many steps (as an import
+            // filling its list of regions) builds it once, not at each step. At once the first time, and in the game.
+            var settled = true;
+            if (state != data.State && data.State != null && (EntityManager.ExecutionMode & ExecutionMode.Editor) != 0)
+            {
+                if (state != data.Pending)
+                    (data.Pending, data.PendingSince) = (state, time.Total.TotalSeconds);
+                settled = time.Total.TotalSeconds - data.PendingSince >= SettleSeconds;
+            }
+            if (state != data.State && settled)
             {
                 data.State = state;
                 Build(terrain, data, device, context.CommandList, root);
@@ -104,18 +123,16 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
         hash.Add(terrain.RegionSize);
         hash.Add(terrain.VertexSpacing);
         hash.Add(terrain.Levels);
-        hash.Add(terrain.BlendSharpness);
         hash.Add(terrain.Collision);
         foreach (var region in terrain.Regions)
             hash.Add(region);
-        foreach (var texture in terrain.Textures)
-        {
-            hash.Add(texture?.Albedo);
-            hash.Add(texture?.UvScale);
-            hash.Add(texture?.Tint);
-        }
-        // Regions made since (by its brushes, before its list has them).
+        hash.Add(terrain.Material);
+        hash.Add(terrain.DebugView);
+        // Regions made since (by its brushes, before its list has them), and its ground replaced (by an import).
         hash.Add(terrain.Data?.Locations.Count);
+        hash.Add(terrain.Data);
+        // The editor's folders on disk known (set once its tools start), so the regions found there are read.
+        hash.Add(TerrainStorage.DiskFolder != null);
         return hash.ToHashCode();
     }
 
@@ -131,7 +148,8 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
     private void Build(TerrainComponent terrain, Built data, GraphicsDevice device, CommandList commandList, Scene root)
     {
         TearDown(data);
-        var locations = terrain.Regions.Select(r => (r.X, r.Y)).ToList();
+        // Its list's regions, and in the editor any whose files are in its folder (made by a stroke the list missed).
+        var locations = terrain.Regions.Select(r => (r.X, r.Y)).Union(TerrainStorage.Found(terrain.Folder)).ToList();
         var old = terrain.Data;
         if (old == null || old.RegionSize != terrain.RegionSize || old.VertexSpacing != terrain.VertexSpacing)
         {
@@ -155,10 +173,13 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
 
         var ground = terrain.Data!;
         var regions = ground.All.ToList();
-        data.Material = Material(device, commandList, terrain);
+        data.Material = Material(device, terrain);
         if (data.Material == null)
             return;
         Maps(data, device, commandList, ground, regions);
+        (data.Low, data.High, data.Bounded) = (float.MaxValue, float.MinValue, null);
+        foreach (var region in regions)
+            Reach(data, region);
         Parameters(terrain, data);
 
         data.Meshes = new[] { Grid(device, null) }.Concat(Enumerable.Range(0, 4).Select(o => Grid(device, new Int2(o % 2, o / 2)))).ToArray();
@@ -199,29 +220,69 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
                 binding.Buffer.Dispose();
         }
         data.Meshes = Array.Empty<Mesh>();
-        foreach (var texture in new[] { data.Heights, data.Control, data.Colors, data.RegionMap, data.Albedo })
+        foreach (var texture in new[] { data.Heights, data.Control, data.Colors, data.RegionMap })
             texture?.Dispose();
-        (data.Heights, data.Control, data.Colors, data.RegionMap, data.Albedo) = (null, null, null, null, null);
+        (data.Heights, data.Control, data.Colors, data.RegionMap) = (null, null, null, null);
         data.Layers.Clear();
         data.Tiles.Clear();
         data.Material = null;
     }
 
     /// <summary>
-    /// Its ground's material: the rings lifted by <see cref="TerrainRingFeature"/>, coloured by <c>TerrainGroundColor</c>.
+    /// Its ground's material: its own (grey for none), with its rings lifted to the ground's heights
+    /// (<c>TerrainRingDisplacement.sdsl</c>) added to its vertex stage, in a copy of it, so any material will do.
     /// </summary>
-    private static Material Material(GraphicsDevice device, CommandList commandList, TerrainComponent terrain) => Rendering.Material.New(device, new MaterialDescriptor
+    private static Material Material(GraphicsDevice device, TerrainComponent terrain)
     {
-        Attributes =
+        var source = terrain.DebugView != TerrainDebugView.None
+            ? Rendering.Material.New(device, new MaterialDescriptor
+            {
+                Attributes =
+                {
+                    Emissive = new MaterialEmissiveMapFeature(new DebugColor((int)terrain.DebugView)),
+                },
+            })
+            : terrain.Material ?? Rendering.Material.New(device, new MaterialDescriptor
         {
-            Displacement = new TerrainRingFeature(),
-            Diffuse = new MaterialDiffuseMapFeature(new ComputeShaderClassColor { MixinReference = "TerrainGroundColor" }),
-            DiffuseModel = new MaterialDiffuseLambertModelFeature(),
-            MicroSurface = new MaterialGlossinessMapFeature(new ComputeFloat(0.1f)),
-            Specular = new MaterialMetalnessMapFeature(new ComputeFloat(0f)),
-            SpecularModel = new MaterialSpecularMicrofacetModelFeature(),
-        },
-    });
+            Attributes =
+            {
+                Diffuse = new MaterialDiffuseMapFeature(new ComputeColor(new Color4(0.5f, 0.5f, 0.5f, 1f))),
+                DiffuseModel = new MaterialDiffuseLambertModelFeature(),
+            },
+        });
+        var material = new Material();
+        foreach (var pass in source.Passes)
+        {
+            var copy = new MaterialPass(new ParameterCollection(pass.Parameters))
+            {
+                CullMode = pass.CullMode,
+                DepthFunction = pass.DepthFunction,
+                BlendState = pass.BlendState,
+                TessellationMethod = pass.TessellationMethod,
+                HasTransparency = pass.HasTransparency,
+                AlphaToCoverage = pass.AlphaToCoverage,
+                IsLightDependent = pass.IsLightDependent,
+                PassIndex = pass.PassIndex,
+            };
+            var lift = new ShaderClassSource("TerrainRingDisplacement");
+            var vertex = copy.Parameters.Get(MaterialKeys.VertexStageSurfaceShaders);
+            if (vertex == null)
+            {
+                copy.Parameters.Set(MaterialKeys.VertexStageSurfaceShaders, lift);
+                copy.Parameters.Set(MaterialKeys.VertexStageStreamInitializer, new ShaderMixinSource { Mixins = { new ShaderClassSource("MaterialStream") } });
+            }
+            else
+            {
+                // After its own vertex work, as a material's displacement is.
+                var both = new ShaderMixinSource { Mixins = { new ShaderClassSource("MaterialSurfaceArray") } };
+                both.AddCompositionToArray("layers", vertex);
+                both.AddCompositionToArray("layers", lift);
+                copy.Parameters.Set(MaterialKeys.VertexStageSurfaceShaders, both);
+            }
+            material.Passes.Add(copy);
+        }
+        return material;
+    }
 
     /// <summary>Puts its regions' heights, control and colours on the GPU, one layer a region, and the map of which layer each is.</summary>
     private static void Maps(Built data, GraphicsDevice device, CommandList commandList, TerrainData ground, List<TerrainRegion> regions)
@@ -229,7 +290,7 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
         var size = ground.RegionSize;
         var layers = Math.Max(regions.Count, 1);
         data.Heights = Texture.New2D(device, size, size, PixelFormat.R32_Float, TextureFlags.ShaderResource, layers);
-        data.Control = Texture.New2D(device, size, size, PixelFormat.R32_Float, TextureFlags.ShaderResource, layers);
+        data.Control = Texture.New2D(device, size, size, PixelFormat.R32_UInt, TextureFlags.ShaderResource, layers);
         data.Colors = Texture.New2D(device, size, size, PixelFormat.R8G8B8A8_UNorm, TextureFlags.ShaderResource, layers);
         var map = new float[RegionMapSize * RegionMapSize];
         for (var layer = 0; layer < regions.Count; layer++)
@@ -250,63 +311,20 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
         data.RegionMap = Texture.New2D(device, RegionMapSize, RegionMapSize, PixelFormat.R32_Float, map);
     }
 
-    /// <summary>
-    /// Its ground textures as one array: copied on the GPU, so each must be the same size, format and number of
-    /// mipmaps as the first (others are left out, and said so). A white one where it has none.
-    /// </summary>
-    private static Texture Albedo(GraphicsDevice device, CommandList commandList, TerrainComponent terrain)
+    private static void Parameters(TerrainComponent terrain, Built data)
     {
-        var textures = terrain.Textures.Select(t => t?.Albedo).ToList();
-        var first = textures.FirstOrDefault(t => t != null);
-        if (first == null)
+        foreach (var pass in data.Material!.Passes)
         {
-            var white = Texture.New2D(device, 1, 1, PixelFormat.R8G8B8A8_UNorm, TextureFlags.ShaderResource, 1);
-            white.SetData(commandList, new[] { 0xFFFFFFFFu });
-            return white;
+            var parameters = pass.Parameters;
+            parameters.Set(TerrainMapsKeys.HeightMaps, data.Heights);
+            parameters.Set(TerrainMapsKeys.ControlMaps, data.Control);
+            parameters.Set(TerrainMapsKeys.ColorMaps, data.Colors);
+            parameters.Set(TerrainMapsKeys.RegionMap, data.RegionMap);
+            parameters.Set(TerrainMapsKeys.VertexSpacing, terrain.VertexSpacing);
+            parameters.Set(TerrainMapsKeys.RegionSize, (float)terrain.RegionSize);
+            parameters.Set(TerrainMapsKeys.RegionMapSize, (float)RegionMapSize);
+            parameters.Set(TerrainMapsKeys.RingCells, (float)RingCells);
         }
-        var array = Texture.New2D(device, first.Width, first.Height, first.MipLevelCount, first.Format, TextureFlags.ShaderResource, Math.Max(textures.Count, 1));
-        for (var i = 0; i < textures.Count; i++)
-        {
-            var texture = textures[i];
-            if (texture == null || texture.Width != first.Width || texture.Height != first.Height || texture.Format != first.Format
-                || texture.MipLevelCount != first.MipLevelCount || texture.ArraySize != 1)
-            {
-                if (texture != null)
-                    Log.Warning($"Terrain texture {i} ({texture.Name}) is not the same size, format and mipmaps as the first: left out.");
-                continue;
-            }
-            for (var mip = 0; mip < first.MipLevelCount; mip++)
-                commandList.CopyRegion(texture, texture.GetSubResourceIndex(0, mip), null, array, array.GetSubResourceIndex(i, mip));
-        }
-        return array;
-    }
-
-    private void Parameters(TerrainComponent terrain, Built data)
-    {
-        var device = graphics!.GraphicsDevice;
-        var commandList = Services.GetService<GraphicsContext>()!.CommandList;
-        data.Albedo = Albedo(device, commandList, terrain);
-        var parameters = data.Material!.Passes[0].Parameters;
-        parameters.Set(TerrainMapsKeys.HeightMaps, data.Heights);
-        parameters.Set(TerrainMapsKeys.ControlMaps, data.Control);
-        parameters.Set(TerrainMapsKeys.ColorMaps, data.Colors);
-        parameters.Set(TerrainMapsKeys.RegionMap, data.RegionMap);
-        parameters.Set(TerrainMapsKeys.AlbedoMaps, data.Albedo);
-        parameters.Set(TerrainMapsKeys.VertexSpacing, terrain.VertexSpacing);
-        parameters.Set(TerrainMapsKeys.RegionSize, (float)terrain.RegionSize);
-        parameters.Set(TerrainMapsKeys.RegionMapSize, (float)RegionMapSize);
-        parameters.Set(TerrainMapsKeys.RingCells, (float)RingCells);
-        parameters.Set(TerrainMapsKeys.BlendSharpness, terrain.BlendSharpness);
-        var scales = new Vector4[8];
-        var tints = new Vector4[32];
-        for (var i = 0; i < 32; i++)
-        {
-            var texture = i < terrain.Textures.Count ? terrain.Textures[i] : null;
-            scales[i / 4][i % 4] = texture?.UvScale ?? 0.1f;
-            tints[i] = texture != null ? new Vector4(texture.Tint.R, texture.Tint.G, texture.Tint.B, 1f) : Vector4.One;
-        }
-        parameters.Set(TerrainMapsKeys.TextureUvScales, scales);
-        parameters.Set(TerrainMapsKeys.TextureTints, tints);
     }
 
     /// <summary>Puts the regions changed on the GPU again (new ones build it all anew), and collides with them again.</summary>
@@ -328,6 +346,7 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
                 continue;
             var layer = data.Layers[location];
             data.Heights.SetData(commandList, region.Heights, layer);
+            Reach(data, region);
             data.Control!.SetData(commandList, region.Control, layer);
             data.Colors!.SetData(commandList, region.Colors, layer);
             if (data.Tiles.Count > 0)
@@ -343,12 +362,41 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
     }
 
     /// <summary>Moves the rings round a place: each to its own cells' doubled step, with the hole for the ring inside it where that ring is.</summary>
+    /// <summary>Its lowest and highest ground taken out to a region's (only growing, until it is built anew).</summary>
+    private static void Reach(Built data, TerrainRegion region)
+    {
+        foreach (var height in region.Heights)
+        {
+            if (height < data.Low)
+                data.Low = height;
+            if (height > data.High)
+                data.High = height;
+        }
+    }
+
     private static void Follow(TerrainComponent terrain, Built data, Vector3 camera)
     {
         var origin = terrain.Origin;
-        var parameters = data.Material!.Passes[0].Parameters;
-        parameters.Set(TerrainMapsKeys.TerrainOrigin, origin);
-        parameters.Set(TerrainMapsKeys.TerrainCamera, camera);
+        // Its rings bounded by its ground's heights (in the world: they are not moved up or down), not as high and low
+        // as ground could be: a light's shadows are fitted to them, and come out coarse round bounds far too tall.
+        if (data.Low <= data.High)
+        {
+            var (low, high) = (origin.Y + data.Low - 1f, origin.Y + data.High + 1f);
+            if (data.Bounded != (low, high))
+            {
+                data.Bounded = (low, high);
+                foreach (var mesh in data.Meshes)
+                {
+                    mesh.BoundingBox = new BoundingBox(new Vector3(mesh.BoundingBox.Minimum.X, low, mesh.BoundingBox.Minimum.Z), new Vector3(mesh.BoundingBox.Maximum.X, high, mesh.BoundingBox.Maximum.Z));
+                    mesh.BoundingSphere = BoundingSphere.FromBox(mesh.BoundingBox);
+                }
+            }
+        }
+        foreach (var pass in data.Material!.Passes)
+        {
+            pass.Parameters.Set(TerrainMapsKeys.TerrainOrigin, origin);
+            pass.Parameters.Set(TerrainMapsKeys.TerrainCamera, camera);
+        }
         if (data.Followed is { } was && Vector3.DistanceSquared(was, camera) < 1e-4f)
             return;
         data.Followed = camera;
@@ -458,4 +506,13 @@ public sealed class TerrainProcessor : EntityProcessor<TerrainComponent, Terrain
         data.Holder.AddChild(entity);
         data.Tiles[tile] = entity;
     }
+}
+
+/// <summary>A terrain's debug view as a material's colour (see <c>TerrainDebugColor.sdsl</c>).</summary>
+internal sealed class DebugColor(int mode) : ComputeNode, IComputeColor
+{
+    public bool HasChanged => false;
+
+    public override ShaderSource GenerateShaderSource(ShaderGeneratorContext context, MaterialComputeColorKeys baseKeys) =>
+        new ShaderClassSource("TerrainDebugColor", mode);
 }

@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Text.RegularExpressions;
 using Stride.Core.IO;
 using Stride.Core.Serialization.Contents;
 
@@ -44,6 +46,32 @@ public static class TerrainStorage
         catch (Exception)
         {
             return null;
+        }
+    }
+
+    /// <summary>The regions whose files are in a terrain's folder on disk: in the editor only (none in the game).</summary>
+    public static IEnumerable<(int X, int Z)> Found(string folder)
+    {
+        if (DiskFolder?.Invoke(folder) is not { } disk || !Directory.Exists(disk))
+            yield break;
+        foreach (var path in Directory.EnumerateFiles(disk, "Region-*" + Extension))
+        {
+            var match = Regex.Match(Path.GetFileNameWithoutExtension(path), @"^Region-X([+-]\d+)-Z([+-]\d+)$");
+            if (match.Success)
+                yield return (int.Parse(match.Groups[1].Value), int.Parse(match.Groups[2].Value));
+        }
+    }
+
+    /// <summary>Deletes a region's file and its raw asset from disk. Only in the editor.</summary>
+    public static void Delete(string folder, int x, int z)
+    {
+        if (DiskFolder?.Invoke(folder) is not { } disk)
+            return;
+        var name = TerrainRegion.NameOf(x, z);
+        foreach (var path in new[] { Path.Combine(disk, name + Extension), Path.Combine(disk, name + ".sdraw") })
+        {
+            if (File.Exists(path))
+                File.Delete(path);
         }
     }
 

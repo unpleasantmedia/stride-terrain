@@ -7,26 +7,10 @@ using Stride.Core.Annotations;
 using Stride.Core.Mathematics;
 using Stride.Engine;
 using Stride.Engine.Design;
-using Stride.Graphics;
+using Stride.Rendering;
 using NVector3 = System.Numerics.Vector3;
 
 namespace Stride.Terrain;
-
-/// <summary>One of a terrain's ground textures, by its place in its list (the id the control map paints with).</summary>
-[DataContract("TerrainTexture")]
-public sealed class TerrainTexture
-{
-    /// <summary>Its colour, with its height in alpha (for blending one texture into another). All a terrain's are the same size and format.</summary>
-    [DataMember(0)]
-    public Texture? Albedo { get; set; }
-
-    /// <summary>How many times it repeats a metre.</summary>
-    [DataMember(10), DataMemberRange(0.001, 10, 0.01, 0.1, 3), DefaultValue(0.1f)]
-    public float UvScale { get; set; } = 0.1f;
-
-    [DataMember(20)]
-    public Color3 Tint { get; set; } = new(1f, 1f, 1f);
-}
 
 /// <summary>
 /// A terrain: ground of square regions of samples (<see cref="RegionSize"/> across, <see cref="VertexSpacing"/> metres
@@ -35,9 +19,25 @@ public sealed class TerrainTexture
 /// entity is; it is not turned or scaled with it. In the editor, its brushes sculpt and paint it; sculpting where it has
 /// no region yet makes one.
 /// </summary>
+/// <summary>What a terrain draws in place of its material (see <c>TerrainDebugColor.sdsl</c>).</summary>
+public enum TerrainDebugView
+{
+    None,
+
+    /// <summary>Green unpainted, red painted, blue no region, magenta a hole.</summary>
+    Control,
+
+    /// <summary>Black flat to white upright.</summary>
+    Slope,
+
+    /// <summary>Red at 0 m, through yellow, green and blue to 500 m, banded every 50 m.</summary>
+    Height,
+}
+
 [DataContract("TerrainComponent")]
 [Display("Terrain", Expand = ExpandRule.Once)]
 [ComponentCategory("Terrain")]
+[ComponentOrder(30100)]
 [DefaultEntityComponentProcessor(typeof(TerrainProcessor), ExecutionMode = ExecutionMode.Runtime | ExecutionMode.Editor)]
 public sealed class TerrainComponent : EntityComponent, ITerrainGround
 {
@@ -61,13 +61,16 @@ public sealed class TerrainComponent : EntityComponent, ITerrainGround
     [DataMember(40), DataMemberRange(1, 12, 1, 1, 0), DefaultValue(8)]
     public int Levels { get; set; } = 8;
 
-    /// <summary>Its ground textures: the control map paints with their places in this list.</summary>
-    [DataMember(50), Display(category: "Textures")]
-    public List<TerrainTexture> Textures { get; } = new();
+    /// <summary>
+    /// What its ground looks like: any material, lifted to its heights automatically. For painted ground, give it Layers,
+    /// each with a Terrain paint blend map of its number (the material's own look is layer 0).
+    /// </summary>
+    [DataMember(50)]
+    public Material? Material { get; set; }
 
-    /// <summary>How sharp the blend between textures is, 0 to 1.</summary>
-    [DataMember(60), Display(category: "Textures"), DataMemberRange(0, 1, 0.01, 0.1, 2), DefaultValue(0.5f)]
-    public float BlendSharpness { get; set; } = 0.5f;
+    /// <summary>Draws what its shaders read in place of its material, to find what is wrong with how it looks.</summary>
+    [DataMember(55), Display("Debug view"), DefaultValue(TerrainDebugView.None)]
+    public TerrainDebugView DebugView { get; set; }
 
     /// <summary>Whether it collides in the game.</summary>
     [DataMember(70), DefaultValue(true)]
@@ -85,21 +88,50 @@ public sealed class TerrainComponent : EntityComponent, ITerrainGround
     [DataMember(120), Display("Strength", category: "Brush"), DataMemberRange(0.01, 100, 0.1, 1, 2), DefaultValue(5f)]
     public float BrushStrength { get; set; } = 5f;
 
-    /// <summary>The texture painting paints with: its place in <see cref="Textures"/>.</summary>
-    [DataMember(130), Display("Paint texture", category: "Brush"), DataMemberRange(0, 31, 1, 1, 0), DefaultValue(0)]
-    public int PaintTexture { get; set; }
+    /// <summary>The layer of its material painting paints with (0 for the material's own look).</summary>
+    [DataMember(130), Display("Paint layer", category: "Brush"), DataMemberRange(0, 31, 1, 1, 0), DefaultValue(0)]
+    public int PaintLayer { get; set; }
 
-    /// <summary>The height Set Height brings the ground to, in metres.</summary>
+    /// <summary>The height Set Height brings the ground to, in metres in the world (as the sea and its material's layers are).</summary>
     [DataMember(140), Display("Set height", category: "Brush"), DefaultValue(0f)]
     public float SetHeight { get; set; }
 
-    /// <summary>Its brush settings, as its maths takes them.</summary>
+    /// <summary>
+    /// A height map to make its ground from: a 16-bit PNG, or a square 16-bit RAW (.raw, .r16) file, little-endian. Its
+    /// path on disk, whole or from the scene's folder.
+    /// </summary>
+    [DataMember(200), Display("Height map", category: "Import")]
+    public string? HeightMap { get; set; }
+
+    /// <summary>The height black is imported at, in metres above its origin.</summary>
+    [DataMember(210), Display("Lowest", category: "Import"), DefaultValue(0f)]
+    public float ImportLowest { get; set; }
+
+    /// <summary>The height white is imported at, in metres above its origin.</summary>
+    [DataMember(220), Display("Highest", category: "Import"), DefaultValue(100f)]
+    public float ImportHighest { get; set; } = 100f;
+
+    /// <summary>
+    /// Ticked, it imports <see cref="HeightMap"/> in the editor, a pixel a sample with its middle on its origin, in
+    /// place of all the ground it had (its region files deleted), then unticks itself.
+    /// </summary>
+    [DataMember(230), Display("Import (replaces all ground)", category: "Import")]
+    public bool Import { get; set; }
+
+    /// <summary>Its brush settings, as its maths takes them (its height from its origin).</summary>
     [DataMemberIgnore]
-    public TerrainBrushSettings Brush => new(BrushRadius, BrushFalloff, BrushStrength, PaintTexture, SetHeight);
+    public TerrainBrushSettings Brush => new(BrushRadius, BrushFalloff, BrushStrength, PaintLayer, SetHeight - Origin.Y);
 
     /// <summary>Its ground, as last loaded: none before its processor has it.</summary>
     [DataMemberIgnore]
     public TerrainData? Data { get; internal set; }
+
+    /// <summary>Takes this ground in place of what it had (as an import makes): drawn and collided with anew.</summary>
+    public void ReplaceData(TerrainData data)
+    {
+        Data = data;
+        Version++;
+    }
 
     /// <summary>Regions changed since they were last put on the GPU and collided with, for its processor to take up.</summary>
     [DataMemberIgnore]
@@ -110,7 +142,15 @@ public sealed class TerrainComponent : EntityComponent, ITerrainGround
     {
         foreach (var region in regions)
             Changed.Add((region.X, region.Z));
+        Version++;
     }
+
+    /// <summary>
+    /// How many times its ground has changed (sculpted, painted, imported) since it was made: for what reads it (as a
+    /// sea's shore) to tell when to read it again.
+    /// </summary>
+    [DataMemberIgnore]
+    public int Version { get; private set; }
 
     /// <summary>Its ground changed in this area: x and z in metres, in the world.</summary>
     public event Action<RectangleF>? GroundChanged;

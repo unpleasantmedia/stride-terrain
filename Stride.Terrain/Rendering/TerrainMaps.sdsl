@@ -1,20 +1,22 @@
 // What a terrain's ground is drawn from (see TerrainProcessor): its regions' maps as texture arrays, one layer a region,
-// a map of which layer each region is in, and its ground textures; all shared by its rings' vertex stage
-// (TerrainRingDisplacement) and its colour (TerrainGroundColor).
+// a map of which layer each region is in, all shared by its rings' vertex stage
+// (TerrainRingDisplacement) and its material's layers' blend maps (TerrainLayerWeight).
 namespace Stride.Terrain
 {
     shader TerrainMaps : Texturing
     {
-        // Each region's heights (a float a sample), control words (as floats' bits: see TerrainControl) and colours.
-        stage Texture2DArray HeightMaps;
-        stage Texture2DArray ControlMaps;
-        stage Texture2DArray ColorMaps;
+        // Bound with the material (PerMaterial), as the cbuffer below is.
+        rgroup PerMaterial
+        {
+            // Each region's heights (a float a sample), control words (see TerrainControl) and colours. The control words are
+            // read as integers: as floats' bits, an unpainted one (only its lowest bit set) would be a denormal, read as 0.
+            stage Texture2DArray HeightMaps;
+            stage Texture2DArray<uint> ControlMaps;
+            stage Texture2DArray ColorMaps;
 
-        // Which layer each region is in, plus one (0 for none): RegionMapSize regions across, the terrain's origin in its middle.
-        stage Texture2D RegionMap;
-
-        // Its ground textures: albedo, with height in alpha (for blending one into another).
-        stage Texture2DArray AlbedoMaps;
+            // Which layer each region is in, plus one (0 for none): RegionMapSize regions across, the terrain's origin in its middle.
+            stage Texture2D RegionMap;
+        }
 
         cbuffer PerMaterial
         {
@@ -28,12 +30,6 @@ namespace Stride.Terrain
             stage float RingCells = 80.0f;
             stage float3 TerrainCamera;
 
-            // How sharp the blend between textures is, 0 to 1.
-            stage float BlendSharpness = 0.5f;
-
-            // Each ground texture's tiling (four to an element) and tint.
-            stage float4 TextureUvScales[8];
-            stage float4 TextureTints[32];
         }
 
         // Where a sample is (in samples from the origin): its place in its region, and its region's layer (-1 for none).
@@ -55,12 +51,7 @@ namespace Stride.Terrain
 
         uint ControlOf(int3 index)
         {
-            return index.z < 0 ? 0u : asuint(ControlMaps.Load(int4(index, 0)).r);
-        }
-
-        float UvScale(int id)
-        {
-            return TextureUvScales[id / 4][id % 4];
+            return index.z < 0 ? 0u : ControlMaps.Load(int4(index, 0));
         }
     };
 }

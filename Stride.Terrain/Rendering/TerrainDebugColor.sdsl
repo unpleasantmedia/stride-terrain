@@ -1,0 +1,32 @@
+// A terrain's ground coloured by what its shaders read there (see TerrainComponent.DebugView), in place of its material:
+// 1, its control words: green unpainted, red painted, blue no region, magenta a hole; 2, its slope, black flat to white
+// upright; 3, its height in the world, a band every 50 m (red at 0, through yellow, green and blue upwards).
+namespace Stride.Terrain
+{
+    shader TerrainDebugColor<int Mode> : ComputeColor, TerrainMaps, PositionStream4, NormalStream
+    {
+        override float4 Compute()
+        {
+            float2 uv = (streams.PositionWS.xz - TerrainOrigin.xz) / VertexSpacing;
+            int3 at = IndexCoord(uv);
+            if (Mode == 1)
+            {
+                if (at.z < 0)
+                    return float4(0, 0, 1, 1);
+                uint control = ControlOf(at);
+                if ((control & 4u) != 0)
+                    return float4(1, 0, 1, 1);
+                return (control & 1u) != 0 ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);
+            }
+            if (Mode == 2)
+            {
+                float slope = degrees(acos(saturate(normalize(streams.meshNormalWS).y)));
+                return float4(slope / 90.0f, slope / 90.0f, slope / 90.0f, 1);
+            }
+            float band = frac(streams.PositionWS.y / 50.0f);
+            float hue = saturate(streams.PositionWS.y / 500.0f);
+            float3 colour = saturate(float3(abs(hue * 6 - 3) - 1, 2 - abs(hue * 6 - 2), 2 - abs(hue * 6 - 4)));
+            return float4(colour * (0.6f + 0.4f * band), 1);
+        }
+    };
+}

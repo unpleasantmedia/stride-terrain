@@ -1,0 +1,50 @@
+// How much of a terrain material's layer is here (see TerrainPaint), as its blend map, from the four samples round the
+// pixel, weighted by how near each is: on an unpainted sample (its auto bit set), whether the ground's height and slope
+// at the pixel are in the layer's ranges; on a painted one, how much it is painted with the layer, as its share of it and the
+// layers before it (a material blends its layers over each other in turn; layer 0 is the material's own look).
+namespace Stride.Terrain
+{
+    shader TerrainLayerWeight<int Layer, float MinHeight, float MaxHeight, float HeightFade, float MinSlope, float MaxSlope, float SlopeFade>
+        : ComputeColor, TerrainMaps, PositionStream4, NormalStream
+    {
+        // 1 inside [low, high], fading to 0 over fade past either end.
+        float Band(float value, float low, float high, float fade)
+        {
+            float f = max(fade, 1e-3f);
+            return smoothstep(low - f, low, value) * (1.0f - smoothstep(high, high + f, value));
+        }
+
+        override float4 Compute()
+        {
+            float2 uv = (streams.PositionWS.xz - TerrainOrigin.xz) / VertexSpacing;
+            float2 index = floor(uv);
+            float2 weight = frac(uv);
+            float2 invert = 1.0f - weight;
+            float4 weights = float4(invert.x * weight.y, weight.x * weight.y, weight.x * invert.y, invert.x * invert.y);
+
+            int3 at0 = IndexCoord(index + float2(0, 1));
+            int3 at1 = IndexCoord(index + float2(1, 1));
+            int3 at2 = IndexCoord(index + float2(1, 0));
+            int3 at3 = IndexCoord(index);
+            uint4 control = uint4(ControlOf(at0), ControlOf(at1), ControlOf(at2), ControlOf(at3));
+
+            // The rules: the ground's height and slope at the pixel, the slope from the drawn surface's own normal (not its
+            // mesh's normal maps), so they follow its triangles, not the cells between samples.
+            float slope = degrees(acos(saturate(normalize(streams.meshNormalWS).y)));
+            float rule = Band(streams.PositionWS.y, MinHeight, MaxHeight, HeightFade) * Band(slope, MinSlope, MaxSlope, SlopeFade);
+
+            // The paint: each sample's share of this layer over those before it.
+            int4 bases = (int4)((control >> 27u) & 0x1Fu);
+            int4 overs = (int4)((control >> 22u) & 0x1Fu);
+            float4 overWeights = (float4)((control >> 14u) & 0xFFu) / 255.0f;
+            float4 baseWeights = 1.0f - overWeights;
+            float4 mine = (bases == Layer ? baseWeights : 0.0f) + (overs == Layer ? overWeights : 0.0f);
+            float4 upTo = (bases <= Layer ? baseWeights : 0.0f) + (overs <= Layer ? overWeights : 0.0f);
+            float4 painted = mine / max(upTo, 1e-5f);
+
+            float4 automatic = (float4)(control & 1u);
+            float share = dot(weights, lerp(painted, rule, automatic));
+            return float4(share, share, share, share);
+        }
+    };
+}

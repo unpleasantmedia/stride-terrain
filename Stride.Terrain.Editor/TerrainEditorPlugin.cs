@@ -1,7 +1,11 @@
 using System;
 using System.IO;
 using System.Linq;
+using Stride.Core.Assets.Editor.Annotations;
 using Stride.Editor;
+using Stride.Terrain;
+
+[assembly: TypeImage(typeof(TerrainComponent), "TerrainComponent.png")]
 
 namespace Stride.Terrain.Editor;
 

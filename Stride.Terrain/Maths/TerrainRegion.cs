@@ -22,6 +22,8 @@ public sealed class TerrainRegion
         Size = size;
         Heights = new float[size * size];
         Control = new uint[size * size];
+        // Unpainted: its layers picked by its material's height and slope rules.
+        Array.Fill(Control, TerrainControl.AutoBit);
         Colors = new uint[size * size];
         Array.Fill(Colors, 0xFFFFFFFFu);
     }
